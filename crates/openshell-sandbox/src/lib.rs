@@ -1331,7 +1331,7 @@ pub(crate) fn bundle_to_resolved_routes(
         .iter()
         .map(|r| {
             let (auth, default_headers, passthrough_headers) =
-                openshell_core::inference::route_headers_for_provider_type(&r.provider_type);
+                openshell_core::inference::route_headers_for_route(&r.provider_type, &r.protocols);
             let timeout = if r.timeout_secs == 0 {
                 openshell_router::config::DEFAULT_ROUTE_TIMEOUT
             } else {
@@ -1347,6 +1347,8 @@ pub(crate) fn bundle_to_resolved_routes(
                 default_headers,
                 passthrough_headers,
                 timeout,
+                model_in_path: r.model_in_path,
+                request_path_override: r.request_path_override.clone(),
             }
         })
         .collect()
@@ -1667,18 +1669,24 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
 /// Ensure a `SandboxPolicy` (Rust type) includes the baseline filesystem
 /// paths required by proxy-mode sandboxes and GPU runtimes. Used for the
 /// local-file code path where no proto is available.
-fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
-    let (ro, rw) =
-        active_baseline_enrichment_paths(matches!(policy.network.mode, NetworkMode::Proxy));
+fn enrich_sandbox_baseline_paths_with<F>(
+    policy: &mut SandboxPolicy,
+    ro: &[String],
+    rw: &[String],
+    path_exists: F,
+) -> bool
+where
+    F: Fn(&std::path::Path) -> bool,
+{
     if ro.is_empty() && rw.is_empty() {
-        return;
+        return false;
     }
 
     let mut modified = false;
-    for path in &ro {
+    for path in ro {
         let p = std::path::PathBuf::from(path);
         if !policy.filesystem.read_only.contains(&p) && !policy.filesystem.read_write.contains(&p) {
-            if !p.exists() {
+            if !path_exists(&p) {
                 debug!(
                     path,
                     "Baseline read-only path does not exist, skipping enrichment"
@@ -1689,12 +1697,12 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
             modified = true;
         }
     }
-    for path in &rw {
+    for path in rw {
         let p = std::path::PathBuf::from(path);
         if policy.filesystem.read_only.contains(&p) || policy.filesystem.read_write.contains(&p) {
             continue;
         }
-        if !p.exists() {
+        if !path_exists(&p) {
             debug!(
                 path,
                 "Baseline read-write path does not exist, skipping enrichment"
@@ -1704,6 +1712,14 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
         policy.filesystem.read_write.push(p);
         modified = true;
     }
+
+    modified
+}
+
+fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
+    let (ro, rw) =
+        active_baseline_enrichment_paths(matches!(policy.network.mode, NetworkMode::Proxy));
+    let modified = enrich_sandbox_baseline_paths_with(policy, &ro, &rw, std::path::Path::exists);
 
     if modified {
         ocsf_emit!(
@@ -1861,6 +1877,42 @@ mod baseline_tests {
         assert!(
             GPU_BASELINE_READ_WRITE.contains(&"/dev/dxg"),
             "/dev/dxg must be in GPU_BASELINE_READ_WRITE for WSL2 support"
+        );
+    }
+
+    #[test]
+    fn local_gpu_enrichment_adds_devices_without_proxy_mode() {
+        let mut policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy {
+                read_only: vec![],
+                read_write: vec![],
+                include_workdir: false,
+            },
+            network: NetworkPolicy {
+                mode: NetworkMode::Block,
+                proxy: None,
+            },
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy::default(),
+        };
+        let (ro, rw) =
+            collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
+
+        let enriched = enrich_sandbox_baseline_paths_with(&mut policy, &ro, &rw, |path| {
+            path == std::path::Path::new("/proc") || path == std::path::Path::new("/dev/nvidia0")
+        });
+
+        assert!(
+            enriched,
+            "GPU enrichment should not require proxy network mode"
+        );
+        assert!(
+            policy
+                .filesystem
+                .read_write
+                .contains(&std::path::PathBuf::from("/dev/nvidia0")),
+            "GPU enrichment should add enumerated device nodes without proxy mode"
         );
     }
 
@@ -2829,15 +2881,30 @@ mod tests {
                     ],
                     provider_type: "openai".to_string(),
                     timeout_secs: 0,
+                    model_in_path: false,
+                    request_path_override: None,
                 },
                 openshell_core::proto::ResolvedRoute {
-                    name: "local".to_string(),
-                    base_url: "http://vllm:8000/v1".to_string(),
-                    api_key: "local-key".to_string(),
-                    model_id: "llama-3".to_string(),
-                    protocols: vec!["openai_chat_completions".to_string()],
-                    provider_type: String::new(),
+                    name: "vertex".to_string(),
+                    base_url: "https://us-east5-aiplatform.googleapis.com/v1/projects/my-project/locations/us-east5/publishers/anthropic/models".to_string(),
+                    api_key: "ya29.vertex".to_string(),
+                    model_id: "claude-3-5-sonnet@20241022".to_string(),
+                    protocols: vec!["anthropic_messages".to_string()],
+                    provider_type: "google-vertex-ai".to_string(),
                     timeout_secs: 120,
+                    model_in_path: true,
+                    request_path_override: Some(":rawPredict".to_string()),
+                },
+                openshell_core::proto::ResolvedRoute {
+                    name: "vertex-gemini".to_string(),
+                    base_url: "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/my-project/locations/us-central1/endpoints/openapi".to_string(),
+                    api_key: "ya29.gemini".to_string(),
+                    model_id: "gemini-2.0-flash-001".to_string(),
+                    protocols: vec!["openai_chat_completions".to_string()],
+                    provider_type: "google-vertex-ai".to_string(),
+                    timeout_secs: 0,
+                    model_in_path: false,
+                    request_path_override: Some("/chat/completions".to_string()),
                 },
             ],
             revision: "abc123".to_string(),
@@ -2846,7 +2913,7 @@ mod tests {
 
         let routes = bundle_to_resolved_routes(&bundle);
 
-        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.len(), 3);
         assert_eq!(routes[0].endpoint, "https://api.example.com/v1");
         assert_eq!(routes[0].model, "gpt-4");
         assert_eq!(routes[0].api_key, "sk-test-key");
@@ -2863,15 +2930,48 @@ mod tests {
             openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
             "timeout_secs=0 should map to default"
         );
-        assert_eq!(routes[1].endpoint, "http://vllm:8000/v1");
+        assert_eq!(
+            routes[0].passthrough_headers,
+            vec!["openai-organization".to_string(), "x-model-id".to_string()]
+        );
+        assert_eq!(
+            routes[1].endpoint,
+            "https://us-east5-aiplatform.googleapis.com/v1/projects/my-project/locations/us-east5/publishers/anthropic/models"
+        );
         assert_eq!(
             routes[1].auth,
             openshell_core::inference::AuthHeader::Bearer
+        );
+        assert_eq!(routes[1].model, "claude-3-5-sonnet@20241022");
+        assert_eq!(routes[1].protocols, vec!["anthropic_messages"]);
+        assert!(routes[1].model_in_path);
+        assert_eq!(
+            routes[1].passthrough_headers,
+            vec!["anthropic-beta".to_string()]
+        );
+        assert_eq!(
+            routes[1].request_path_override,
+            Some(":rawPredict".to_string())
         );
         assert_eq!(
             routes[1].timeout,
             Duration::from_secs(120),
             "timeout_secs=120 should map to 120s"
+        );
+        assert_eq!(
+            routes[2].endpoint,
+            "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/my-project/locations/us-central1/endpoints/openapi"
+        );
+        assert_eq!(routes[2].model, "gemini-2.0-flash-001");
+        assert_eq!(routes[2].protocols, vec!["openai_chat_completions"]);
+        assert!(!routes[2].model_in_path);
+        assert_eq!(
+            routes[2].request_path_override,
+            Some("/chat/completions".to_string())
+        );
+        assert!(
+            routes[2].passthrough_headers.is_empty(),
+            "Vertex Gemini routes must not inherit Anthropic passthrough headers"
         );
     }
 
@@ -2898,6 +2998,8 @@ mod tests {
                 protocols: vec!["openai_chat_completions".to_string()],
                 provider_type: "openai".to_string(),
                 timeout_secs: 0,
+                model_in_path: false,
+                request_path_override: None,
             }],
             revision: "rev".to_string(),
             generated_at_ms: 0,
@@ -2920,6 +3022,8 @@ mod tests {
                 default_headers: vec![],
                 passthrough_headers: vec![],
                 timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+                model_in_path: false,
+                request_path_override: None,
             },
             openshell_router::config::ResolvedRoute {
                 name: "sandbox-system".to_string(),
@@ -2931,6 +3035,8 @@ mod tests {
                 default_headers: vec![],
                 passthrough_headers: vec![],
                 timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+                model_in_path: false,
+                request_path_override: None,
             },
         ];
 
@@ -3247,6 +3353,8 @@ filesystem_policy:
             default_headers: vec![],
             passthrough_headers: vec![],
             timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
         }];
 
         let cache = Arc::new(RwLock::new(routes));

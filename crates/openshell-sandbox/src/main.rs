@@ -152,6 +152,10 @@ struct Args {
     /// enforcement runs in another pod.
     #[arg(long, default_value = DEFAULT_MODE)]
     mode: Mode,
+
+    //TODO: flag for immutable policy
+    #[arg(long, env = openshell_core::sandbox_env::IMMUTABLE_POLICY)]
+    immutable_policy: bool,
 }
 
 /// Copy the running executable to `dest`, creating parent directories as

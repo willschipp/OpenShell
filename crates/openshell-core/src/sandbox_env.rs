@@ -71,3 +71,6 @@ pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";
 /// exchanges without using SPIFFE for gateway authentication.
 pub const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET: &str =
     "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET";
+
+/// Immutable Policy Flag
+pub const IMMUTABLE_POLICY: &str = "OPENSHELL_IMMUTABLE_POLICY";

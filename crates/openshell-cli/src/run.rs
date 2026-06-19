@@ -6617,6 +6617,7 @@ pub async fn sandbox_policy_update(
         return Err(miette!("--wait cannot be combined with --dry-run"));
     }
 
+
     let plan = build_policy_update_plan(
         add_endpoints,
         remove_endpoints,
@@ -6643,6 +6644,8 @@ pub async fn sandbox_policy_update(
     } else {
         sandbox.object_id().to_string()
     };
+
+    //TODO: add check of immutable sandbox
 
     let current = client
         .get_sandbox_config(GetSandboxConfigRequest { sandbox_id })
